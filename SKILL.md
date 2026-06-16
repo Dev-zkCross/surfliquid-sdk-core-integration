@@ -498,6 +498,8 @@ To restore the in-memory state on load, do one of:
 - Call `client.authenticate()` again (prompts another signature), or
 - Wire up `client.getMe()` style rehydration: `getMe()` (`GET /api/auth/me`) uses the existing cookie to return the live `UserProfile`. Note: `getMe()` exists on `AuthService` but is **not** wired into `SurfClient`'s public flow — you'd access it via your own integration if you want silent rehydration without a fresh signature.
 
+To **extend** an already-valid session (not just read it), call `client.refreshSession()` (`POST /api/auth/refresh`). It uses the existing cookie to rotate it for a new ~7-day token without a fresh signature, returning `{ expiresAt }`. It does not repopulate the in-memory `AuthState`, so pair it with `authenticate()` or `getMe()` if you also need to restore `authenticated`/`user`.
+
 ### `logout()` is local-only
 
 `client.logout()` clears the in-memory `AuthState` (sets `token`, `address`, `user` to `null` and `authenticated` to `false`) and emits `auth:logout`. It **cannot** delete the httpOnly, cross-origin cookie from JavaScript — that cookie is invisible to script by design. To truly end the session you must call a server-side logout endpoint that clears the cookie (`Set-Cookie` with an expired/empty value); the SDK does not do this for you.
@@ -612,6 +614,20 @@ Flow: requests a nonce/message (`POST /api/auth/nonce`), asks the wallet to `sig
 
 Clears local auth state (`token`, `address`, `user`, `authenticated`) and emits `auth:logout`. It does **not** call the backend and **cannot** delete the httpOnly cross-origin cookie from JS — the browser session may persist server-side until it expires.
 
+#### `refreshSession(): Promise<RefreshResult>`
+
+| | |
+|---|---|
+| **Params** | none |
+| **Returns** | `Promise<RefreshResult>` = `{ expiresAt: string }` (ISO 8601 expiry of the freshly issued session token). |
+| **Requires** | a currently-valid session cookie (no wallet signature, no body) |
+
+REST `POST /api/auth/refresh`. Extends the session using the existing httpOnly auth cookie sent via `credentials: "include"` — there is **no** wallet signature and **no** request body (`Content-Type: application/json` is set automatically). The backend rotates the cookie (issuing a new ~7-day token) and invalidates the old token immediately. Does not re-prompt the wallet and does not mutate `getAuthState()`.
+
+**Throws:** `SurfError(API_ERROR, "Request failed with status 401", ...)` if the cookie is missing, expired, or already revoked.
+
+> Recommended usage: call this **proactively before expiry** (e.g. when fewer than 24h remain on the session) to extend the session without re-signing. Because it relies on the existing cookie, the same credentialed-CORS requirements apply.
+
 ---
 
 ### Vault
@@ -621,7 +637,7 @@ Clears local auth state (`token`, `address`, `user`, `authenticated`) and emits 
 | | |
 |---|---|
 | **Params** | `walletAddress` — optional EOA address. |
-| **Returns** | `Promise<VaultInfo>`. Key fields: `userVaultAddress: string \| null`, `deploymentSalt: string \| null`, `exists: boolean` (true iff `userVaultAddress` is set), `assets?: VaultAsset[]` (defaults to `[]`), plus optional `homeChainId`, `totalValueUSD`, `apyBreakdown`, etc. |
+| **Returns** | `Promise<VaultInfo>`. Key fields: `userVaultAddress: string \| null`, `deploymentSalt: string \| null`, `exists: boolean` (true iff `userVaultAddress` is set), `assets?: VaultAsset[]` (defaults to `[]`), plus optional `homeChainId`, `totalValueUSD`, `apyBreakdown` (which carries `currentAPY`/`nativeAPY`/`merklAPY`/`leagueAPY` and optional `totalAPY`, `apy7d`/`apy14d`/`apy30d`), etc. |
 | **Requires** | wallet (conditional — only when `walletAddress` is omitted) |
 
 REST `GET /api/v4/vault?walletAddress=<addr>`. When `walletAddress` is omitted, uses the connected wallet's address.
@@ -643,20 +659,20 @@ Mixed REST + on-chain flow. Checks `getVault()` for an existing vault on the con
 | | |
 |---|---|
 | **Params** | `chainId` — optional; filters results client-side. |
-| **Returns** | `Promise<SupportedAsset[]>`; each = `{ assetAddress, assetSymbol, assetDecimals, chainId, chainStatus, currentAPY, nativeAPY, merklAPY, leagueAPY }`. |
+| **Returns** | `Promise<SupportedAsset[]>`; each = `{ assetAddress, assetSymbol, assetDecimals, chainId, chainStatus, currentAPY, nativeAPY, merklAPY, leagueAPY }` plus optional trailing-window APYs `apy7d?`, `apy14d?`, `apy30d?` (`number \| null`, `null` until enough history exists). |
 | **Requires** | none |
 
 REST. Internally reads the `defaultAssets` of `GET /api/v4/vault?walletAddress=0x` (sentinel address) and filters by `chainId` in-process if provided.
 
-#### `getAgentMessages(walletAddress?: Address, page = 1, limit = 20): Promise<AgentMessagesResult>`
+#### `getAgentMessages(walletAddress?: Address, page = 1, limit = 20, from?: string, to?: string): Promise<AgentMessagesResult>`
 
 | | |
 |---|---|
-| **Params** | `walletAddress` — optional; `page` (default `1`), `limit` (default `20`). |
+| **Params** | `walletAddress` — optional; `page` (default `1`), `limit` (default `20`); `from` / `to` — optional ISO-8601 timestamp strings that filter results by `timestamp`, inclusive on both ends. |
 | **Returns** | `Promise<AgentMessagesResult>` = `{ page, limit, total, pages, messages: AgentMessage[] }`. |
 | **Requires** | wallet (conditional — only when `walletAddress` is omitted) |
 
-REST `GET /api/v4/agent-messages?walletAddress=&page=&limit=`.
+REST `GET /api/v4/agent-messages?walletAddress=&page=&limit=` (with `&from=&to=` appended, URL-encoded, when provided).
 
 #### `getOwnerVaults(owner?: Address): Promise<string[]>`
 
@@ -1010,6 +1026,10 @@ export interface AuthState {
   authenticated: boolean;
   user: UserProfile | null;
 }
+
+export interface RefreshResult {
+  expiresAt: string;
+}
 ```
 
 > **Cookie-based auth:** `AuthState.token` is typed `string | null` but is **always `null`** even when `authenticated: true` — the session lives in an httpOnly cookie the SDK never reads. Gate logic on `authenticated` / `user`, never on `token`.
@@ -1040,6 +1060,10 @@ export interface VaultApyBreakdown {
   merklAPY: number;
   leagueAPY: number;
   currentAPY: number;
+  totalAPY?: number;            // alias some responses use for the blended current APY
+  apy7d?: number | null;        // trailing-window APYs (portfolio-weighted); null until enough history
+  apy14d?: number | null;
+  apy30d?: number | null;
 }
 
 export interface VaultLeague {
@@ -1066,6 +1090,9 @@ export interface VaultAsset {
   nativeAPY: number;
   merklAPY: number;
   leagueAPY: number;
+  apy7d?: number | null;        // trailing-window APYs for this asset; null until enough history
+  apy14d?: number | null;
+  apy30d?: number | null;
   leagueEarnedUSD: number;
   cumulativeReturn: number;
   vaultAddress: string;
@@ -1127,6 +1154,15 @@ export interface SupportedAsset {
   nativeAPY: number;
   merklAPY: number;
   leagueAPY: number;
+  apy7d?: number | null;        // trailing-window APYs; null/absent when the position has no history
+  apy14d?: number | null;
+  apy30d?: number | null;
+}
+
+export interface VaultRef {
+  name: string;
+  address: string;
+  apy: number;
 }
 
 export interface AgentMessage {
@@ -1135,15 +1171,31 @@ export interface AgentMessage {
   timestamp: string;
   transactionType:
     | "INITIAL_DEPOSIT"
+    | "DEPOSIT"
     | "USER_DEPOSIT"
+    | "WITHDRAWAL"
     | "USER_WITHDRAWAL"
     | "REBALANCE"
+    | "REBALANCE_COMPLETED"
+    | "REBALANCE_CANCELLED"
     | "CROSS_CHAIN_REBALANCE"
+    | "MERKL_CLAIM"
+    | "ASSET_ADDED"
+    | "ASSET_REMOVED"
+    | "ASSET_SWAPPED"
     | "MIGRATE"
     | string;
   executedBy: "USER" | "AGENT";
   vaultVersion: string;
   chainId: number;
+  // Optional structured fields derived from the transaction; omitted when not applicable.
+  signal?: string | null;
+  amount?: number | null;
+  token?: string | null;
+  fromVault?: VaultRef | null;
+  toVault?: VaultRef | null;
+  apyBefore?: number | null;
+  apyAfter?: number | null;
 }
 
 export interface AgentMessagesResult {
@@ -1163,8 +1215,9 @@ export interface BestVaultOption {
 > `PortfolioSummary.deposited` / `currentValues` / `profits` are `bigint[]` (raw on-chain values aligned by index with `assets`); format with `formatTokenAmount` for display. `activeCount` is the number of active asset positions.
 > `FeeInfo` fee fields are `bigint` (scaled basis points), not JS numbers; `revenueAddress` is a plain `string`.
 > Mixed address typing: `DepositParams.asset`, `WithdrawParams.asset`, and `BestVaultOption.vaultAddress` are typed `Address`, while `VaultInfo.userVaultAddress`, `VaultAsset.assetAddress`, `SupportedAsset.assetAddress`, and `DepositParams.vaultAddress`/`bestVault` are plain `string`.
-> `AgentMessage.transactionType` is widened by `| string`, so the literal union is non-exhaustive — handle unknown values in switch statements.
+> `AgentMessage.transactionType` is widened by `| string`, so the literal union (which now also covers `DEPOSIT`, `WITHDRAWAL`, `REBALANCE_COMPLETED`, `REBALANCE_CANCELLED`, `MERKL_CLAIM`, `ASSET_ADDED`, `ASSET_REMOVED`, `ASSET_SWAPPED`) is non-exhaustive — handle unknown values in switch statements. The structured fields (`amount`, `token`, `fromVault`, `toVault`, `apyBefore`, `apyAfter`, `signal`) are optional **and** nullable, and present only for the transaction types they apply to (e.g. `fromVault`/`toVault`/`apyBefore`/`apyAfter` on rebalance/migration messages).
 > Check `VaultInfo.exists` first; analytics fields (`earned`/`apyBreakdown`/`league`/`assets`) and most metadata are optional **and** nullable, so a present-but-`null` value differs from an absent (`undefined`) one.
+> Trailing-window APYs (`apy7d`/`apy14d`/`apy30d`) on `VaultApyBreakdown` (portfolio-weighted, alongside the optional `totalAPY` alias for the blended current APY), `VaultAsset`, and `SupportedAsset` are optional and `null` until enough history exists — distinguish `null` (insufficient history) from absent.
 
 ### Config (`config.ts`)
 

@@ -58,6 +58,8 @@ export default function App() {
   const [asset, setAsset] = useState(DEFAULTS.asset);
   const [depositAmount, setDepositAmount] = useState(DEFAULTS.depositAmount);
   const [withdrawAmount, setWithdrawAmount] = useState(DEFAULTS.withdrawAmount);
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   // Flow state — drives which buttons are visible.
@@ -243,6 +245,13 @@ export default function App() {
     });
   }
 
+  async function refreshSession() {
+    await runAction("Refresh session", async () => {
+      const result = await ensureClient().refreshSession();
+      pushLog("success", `Session refreshed — new expiry: ${result.expiresAt || "(unknown)"}`);
+    });
+  }
+
   async function resolveVault() {
     await runAction("Get vault", async () => {
       const client = ensureClient();
@@ -264,6 +273,7 @@ export default function App() {
       if (vault.apyBreakdown) {
         const b = vault.apyBreakdown;
         pushLog("info", `APY: ${b.currentAPY}% total (native ${b.nativeAPY}% + merkl ${b.merklAPY}% + league ${b.leagueAPY}%)`);
+        pushLog("info", `APY windows: 7d ${b.apy7d ?? "—"}% · 14d ${b.apy14d ?? "—"}% · 30d ${b.apy30d ?? "—"}%`);
       }
 
       if (vault.earned) {
@@ -281,7 +291,7 @@ export default function App() {
         for (const a of vault.assets) {
           pushLog(
             "info",
-            `  ${a.assetSymbol} on chain ${a.chainId} [${a.chainStatus}] — balance: ${a.balance} · value: $${a.currentValueUSD.toFixed(2)} · APY: ${a.currentAPY}% · deposited: $${a.depositedAmountUSD.toFixed(2)}`,
+            `  ${a.assetSymbol} on chain ${a.chainId} [${a.chainStatus}] — balance: ${a.balance} · value: $${a.currentValueUSD.toFixed(2)} · APY: ${a.currentAPY}% (7d ${a.apy7d ?? "—"} · 14d ${a.apy14d ?? "—"} · 30d ${a.apy30d ?? "—"}) · deposited: $${a.depositedAmountUSD.toFixed(2)}`,
           );
         }
       }
@@ -342,10 +352,17 @@ export default function App() {
 
   async function getAgentMessages() {
     await runAction("Get agent messages", async () => {
-      const result = await ensureClient().getAgentMessages();
+      const result = await ensureClient().getAgentMessages(
+        undefined,
+        1,
+        20,
+        fromDate.trim() || undefined,
+        toDate.trim() || undefined,
+      );
+      const filter = fromDate || toDate ? ` (filtered ${fromDate || "…"} → ${toDate || "…"})` : "";
       pushLog(
         "success",
-        `Agent messages — page ${result.page}/${result.pages}, total: ${result.total}`,
+        `Agent messages — page ${result.page}/${result.pages}, total: ${result.total}${filter}`,
       );
       if (result.messages.length === 0) {
         pushLog("info", "No activity found.");
@@ -355,8 +372,22 @@ export default function App() {
         const date = new Date(msg.timestamp).toLocaleString();
         pushLog(
           "info",
-          `[${date}] [${msg.transactionType}] [${msg.executedBy}] chain:${msg.chainId} tx:${msg.txHash} — ${msg.message}`,
+          `[${date}] [${msg.transactionType}] [${msg.executedBy}] chain:${msg.chainId} — ${msg.message}`,
         );
+        // Surface the new structured fields when present.
+        const parts: string[] = [];
+        if (msg.amount != null) {
+          parts.push(`amount ${msg.amount}${msg.token ? ` ${msg.token}` : ""}`);
+        }
+        if (msg.fromVault || msg.toVault) {
+          parts.push(`${msg.fromVault?.name ?? "—"} → ${msg.toVault?.name ?? "—"}`);
+        }
+        if (msg.apyBefore != null || msg.apyAfter != null) {
+          parts.push(`APY ${msg.apyBefore ?? "—"}% → ${msg.apyAfter ?? "—"}%`);
+        }
+        if (parts.length > 0) {
+          pushLog("info", `    ↳ ${parts.join(" · ")}`);
+        }
       }
     });
   }
@@ -503,6 +534,22 @@ export default function App() {
                 onChange={(event) => setWithdrawAmount(event.target.value)}
               />
             </label>
+            <label>
+              Activity from (ISO, optional)
+              <input
+                placeholder="2026-06-01"
+                value={fromDate}
+                onChange={(event) => setFromDate(event.target.value)}
+              />
+            </label>
+            <label>
+              Activity to (ISO, optional)
+              <input
+                placeholder="2026-06-15"
+                value={toDate}
+                onChange={(event) => setToDate(event.target.value)}
+              />
+            </label>
           </div>
           <div className="button-row">
             <button className="action primary" onClick={createClient} disabled={Boolean(busyAction)}>
@@ -531,6 +578,11 @@ export default function App() {
             {flowsReady && (
               <button className="action" onClick={resolveVault} disabled={Boolean(busyAction)}>
                 Get vault
+              </button>
+            )}
+            {authenticated && (
+              <button className="action" onClick={refreshSession} disabled={Boolean(busyAction)}>
+                Refresh session
               </button>
             )}
           </div>

@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@surf_liquid/core-sdk": "^0.2.2",
+    "@surf_liquid/core-sdk": "^3.0.0",
     "@walletconnect/ethereum-provider": "^2.23.9",
     "ethers": "^6.15.0",
     "react": "^18.3.1",
