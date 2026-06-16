@@ -1,0 +1,27 @@
+{
+  "name": "surfliquid-sdk-example",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Example React + Vite app integrating the published @surf_liquid/core-sdk npm package.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@surf_liquid/core-sdk": "^0.2.2",
+    "@walletconnect/ethereum-provider": "^2.23.9",
+    "ethers": "^6.15.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.2.0"
+  }
+}
