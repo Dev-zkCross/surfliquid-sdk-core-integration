@@ -82,12 +82,13 @@ Defined in `src/config/chains.ts` (`CHAIN_REGISTRIES` + `DEFAULT_CHAIN_IDS`). Th
 | Environment | Chain | Chain ID | Default RPC URL | Factory address | WETH address | Block explorer | Tokens | Default for env |
 |---|---|---|---|---|---|---|---|---|
 | `mainnet` | Base | `8453` | `https://mainnet.base.org` | `0x8fa50DeA8DB10987D7d22ac092001c3613C18779` | `0x4200000000000000000000000000000000000006` | `https://basescan.org` | USDC, WETH, cbBTC | yes |
-| `mainnet` | Polygon | `137` | `https://rpc.ankr.com/polygon` | `0x8fa50DeA8DB10987D7d22ac092001c3613C18779` | `0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619` (Polygon WETH) | `https://polygonscan.com` | USDC | — |
+| `mainnet` | Ethereum | `1` | `https://ethereum-rpc.publicnode.com` | `0x8fa50DeA8DB10987D7d22ac092001c3613C18779` | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` | `https://etherscan.io` | USDC, WETH | — |
+| `mainnet` | Polygon | `137` | `https://polygon-bor-rpc.publicnode.com` | `0x8fa50DeA8DB10987D7d22ac092001c3613C18779` | `0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619` (Polygon WETH) | `https://polygonscan.com` | USDC | — |
 | `testnet` | Base Sepolia | `84532` | `""` (none — you must supply `rpcUrl`) | `0x0000…0000` (zero) | `0x0000…0000` (zero) | `https://sepolia.basescan.org` | none (`[]`) | yes |
 
 Notes:
 
-- Base and Polygon **share the same factory address** (`0x8fa50DeA…C18779`).
+- Base, Polygon, and Ethereum **share the same factory address** (`0x8fa50DeA…C18779`).
 - Polygon's config field is named `wethAddress` but holds Polygon's WETH (`0x7ceB23fD…f619`), not WMATIC/WPOL — the field name is generic across chains.
 - The default RPCs are public and rate-limited; production consumers should override via `setRpcUrl(...)` or the `rpcUrl` config field.
 - **Base Sepolia (testnet) is a non-functional stub** out of the box: empty `rpcUrl`, zero factory/WETH addresses, and no tokens. To use it you must supply your own `rpcUrl` and register the chain's real contracts/tokens via `registerChain` / `registerToken` (or `setFactoryAddress`).
@@ -211,8 +212,8 @@ These are the fields of `SurfConfig` (the input to `SurfClient.create`). Default
 | `appId` | `string` | **Yes** (one of `appId`/`projectId`) | — | Your Surf application id. Takes precedence over `projectId`. |
 | `projectId` | `string` | **Yes** (one of `appId`/`projectId`) | — | Backwards-compatible alias for `appId`. Resolved as `appId ?? projectId`; the SDK unifies both to a single value. |
 | `environment` | `"mainnet"` \| `"testnet"` | No | `"mainnet"` | Target environment. Anything else throws `INVALID_ENVIRONMENT`. |
-| `chainId` | `number` | No | `8453` on mainnet, `84532` on testnet | Chain to use. Must be a chain registered for the environment, else `UNSUPPORTED_CHAIN`. Built-in mainnet chains: `8453` (Base), `137` (Polygon). |
-| `rpcUrl` | `string` | No | the selected chain's built-in `rpcUrl` | JSON-RPC endpoint. If omitted, falls back to the chain default (Base → `https://mainnet.base.org`, Polygon → `https://rpc.ankr.com/polygon`). Base Sepolia has no default, so you must supply one. Use a dedicated RPC in production. |
+| `chainId` | `number` | No | `8453` on mainnet, `84532` on testnet | Chain to use. Must be a chain registered for the environment, else `UNSUPPORTED_CHAIN`. Built-in mainnet chains: `8453` (Base), `137` (Polygon), `1` (Ethereum). |
+| `rpcUrl` | `string` | No | the selected chain's built-in `rpcUrl` | JSON-RPC endpoint. If omitted, falls back to the chain default (Base → `https://mainnet.base.org`, Polygon → `https://polygon-bor-rpc.publicnode.com`, Ethereum → `https://ethereum-rpc.publicnode.com`). Base Sepolia has no default, so you must supply one. Use a dedicated RPC in production. |
 | `apiBaseUrl` | `string` | No | `"https://api.surfliquid.com"` | Base URL of the Surf backend API. |
 | `factoryAddress` | `` `0x${string}` `` | No | the selected chain's `factoryAddress` | Override the vault factory address. If omitted (or set to the zero address), the chain's configured factory is used. |
 | `autoApprove` | `boolean` | No | `true` | When `true`, ERC-20 approvals are handled automatically before deposits. **Defaults to `true`** — pass `false` to require explicit approvals. |
@@ -1113,6 +1114,13 @@ export interface VaultInfo {
   apyBreakdown?: VaultApyBreakdown | null;
   league?: VaultLeague | null;
   assets?: VaultAsset[];
+  /** Per-chain vault addresses; can differ from userVaultAddress (e.g. Ethereum). */
+  chainAddresses?: VaultChainAddress[];
+}
+
+export interface VaultChainAddress {
+  chainId: number;
+  vaultAddress: string;
 }
 
 export interface PortfolioSummary {
@@ -1709,7 +1717,8 @@ console.log("Tokens:", surf.getSupportedTokens().map((t) => t.symbol)); // ["USD
 - **`deposit()` does not await the deposit tx.** It returns a `TransactionResult { hash, wait() }` immediately after submitting the deposit (only the optional wrap and approval txs are awaited internally). Call `await result.wait()` yourself if you need on-chain confirmation. `wait()` can resolve to `null`.
 - **`deposit` matches `asset` by ADDRESS, not symbol.** `params.asset` must be a token **address** registered in the current chain's token list (case-insensitive match). Passing a symbol like `"USDC"` throws `SurfError(INVALID_CONFIG, ...)`. Pull addresses from `getSupportedTokens()` / `getSupportedAssets()`.
 - **Best-vault resolution order:** `params.bestVault` (if provided) → REST `getBestVault(token.symbol)` filtered to `config.chainId` → on-chain `getAssetAvailableVaults(vault, asset)` taking index `[0]` → otherwise throws `SurfError(NO_BEST_VAULT, ...)`. This only matters for the **initial** deposit of an asset (subsequent deposits route through `userDeposit` and need no best vault).
-- **`rpcUrl` override applies to ALL chains.** The single `rpcUrl` config builds one `JsonRpcProvider` used for every read. It is not keyed per chain. Do **not** hardcode one chain's RPC if you may operate on another — every read method goes through that one provider. If omitted, the SDK falls back to the configured chain's default RPC (Base `https://mainnet.base.org`, Polygon `https://rpc.ankr.com/polygon`; Base Sepolia has `""` and **must** be supplied).
+- **`rpcUrl` override applies to ALL chains.** The single `rpcUrl` config builds one `JsonRpcProvider` used for every read. It is not keyed per chain. Do **not** hardcode one chain's RPC if you may operate on another — every read method goes through that one provider. If omitted, the SDK falls back to the configured chain's default RPC (Base `https://mainnet.base.org`, Polygon `https://polygon-bor-rpc.publicnode.com`; Base Sepolia has `""` and **must** be supplied).
+- **A vault can have a different address per chain.** `VaultInfo.chainAddresses` lists per-chain vault addresses; on chains like Ethereum the vault address differs from the top-level `userVaultAddress` (the home-chain address). The SDK resolves the correct per-chain address automatically **only when you pass no `vaultAddress`** to `deposit`/`withdraw`/`getPortfolioSummary`/`getWithdrawableAmount`/`getAssetProfit`/etc. **Passing an explicit `userVaultAddress` on a non-home chain bypasses that resolution** and targets an address with no vault contract there, so the call fails with ethers `BAD_DATA` (`could not decode result data`, `value="0x"`). If you must pass one, use `chainAddresses.find(c => c.chainId === activeChainId)?.vaultAddress`.
 - **`switchChain()` does not update `config.chainId`.** It changes only the wallet's chain (`walletState.chainId`). `getChainConfig()`, `factoryAddress`, `wethAddress`, token resolution, and the read provider all keep using the originally configured chain. To truly operate on another chain, build a new client (or `setChain` before build), don't rely on `switchChain`.
 - **`getVault`, `getSupportedAssets`, `getAgentMessages`, `getBestVault` are public** (no wallet/auth required) — but `getVault` and `getAgentMessages` need an address. If you omit `walletAddress`, they fall back to `requireWallet().address` and will throw `WALLET_NOT_CONNECTED` when no wallet is connected. Pass an explicit address to call them without a connected wallet. (`getSupportedAssets` and `getBestVault` need neither wallet nor an address.)
 - **Register custom chains/tokens BEFORE `setChain`/`build`.** Use the builder: `registerChain(env, chainConfig)` then `registerToken(...)`, and only then `setChain(chainId)` / `build()`. Registering after build has no effect on an already-constructed client. Note also that the standalone helpers `getFactoryAddress`/`getWethAddress` read the module-level `CHAIN_REGISTRIES`, so they won't see chains you registered on the builder.

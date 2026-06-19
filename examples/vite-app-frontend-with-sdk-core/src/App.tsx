@@ -21,6 +21,7 @@ type LogEntry = {
 type VaultLike = {
   exists: boolean;
   assets?: Array<{ chainId: number; vaultAddress?: string }>;
+  chainAddresses?: Array<{ chainId: number; vaultAddress?: string }>;
 };
 
 // A vault counts as "deployed on this chain" when the vault exists and has at
@@ -30,7 +31,26 @@ type VaultLike = {
 function isVaultDeployedOnChain(vault: VaultLike, chainId: number): boolean {
   return Boolean(
     vault.exists &&
-      vault.assets?.some((a) => a.chainId === chainId && Boolean(a.vaultAddress)),
+      (vault.chainAddresses?.some(
+        (c) => c.chainId === chainId && Boolean(c.vaultAddress),
+      ) ||
+        vault.assets?.some((a) => a.chainId === chainId && Boolean(a.vaultAddress))),
+  );
+}
+
+// Resolve the vault's address on a specific chain (it can differ per chain),
+// preferring the per-chain `chainAddresses` entry over the home `userVaultAddress`.
+function vaultAddressForChain(
+  vault: {
+    userVaultAddress?: string | null;
+    chainAddresses?: Array<{ chainId: number; vaultAddress?: string }>;
+  },
+  chainId: number,
+): string | null {
+  return (
+    vault.chainAddresses?.find((c) => c.chainId === chainId)?.vaultAddress ??
+    vault.userVaultAddress ??
+    null
   );
 }
 
@@ -165,12 +185,13 @@ export default function App() {
     const { chainId: activeChainId } = client.getConfig();
     const vault = await client.getVault();
     const deployed = isVaultDeployedOnChain(vault, activeChainId);
-    setVaultAddress(vault.userVaultAddress);
+    const addr = vaultAddressForChain(vault, activeChainId);
+    setVaultAddress(addr);
     setVaultDeployed(deployed);
     pushLog(
       deployed ? "success" : "info",
       deployed
-        ? `Vault deployed on chain ${activeChainId}: ${vault.userVaultAddress}`
+        ? `Vault deployed on chain ${activeChainId}: ${addr}`
         : `No vault on chain ${activeChainId} yet — deploy one to continue.`,
     );
     return deployed;
@@ -184,7 +205,7 @@ export default function App() {
         environment,
         chainId: Number(chainId),
         // No rpcUrl override: the SDK uses its built-in public RPC for the
-        // selected chain (Base -> mainnet.base.org, Polygon -> rpc.ankr.com/polygon).
+        // selected chain. Override via `rpcUrl` with a dedicated endpoint in production.
       });
 
       // Set up WalletConnect adapter if a project ID is provided
@@ -256,8 +277,9 @@ export default function App() {
     await runAction("Get vault", async () => {
       const client = ensureClient();
       const vault = await client.getVault();
-      setVaultAddress(vault.userVaultAddress);
-      setVaultDeployed(isVaultDeployedOnChain(vault, client.getConfig().chainId));
+      const activeChainId = client.getConfig().chainId;
+      setVaultAddress(vaultAddressForChain(vault, activeChainId));
+      setVaultDeployed(isVaultDeployedOnChain(vault, activeChainId));
 
       if (!vault.exists) {
         pushLog("info", "No vault registered yet.");
@@ -330,12 +352,9 @@ export default function App() {
 
   async function readPortfolio() {
     await runAction("Read portfolio", async () => {
-      const client = ensureClient();
-      const targetVault = vaultAddress ?? (await client.getVault()).userVaultAddress;
-      if (!targetVault) {
-        throw new Error("No vault address available.");
-      }
-      const summary = await client.getPortfolioSummary(targetVault);
+      // Pass no address: the SDK resolves the vault for the active chain (it can
+      // differ per chain). Passing the home address would break on other chains.
+      const summary = await ensureClient().getPortfolioSummary();
       pushLog(
         "info",
         `Portfolio active assets: ${summary.activeCount}, tracked assets: ${summary.assets.length}`,

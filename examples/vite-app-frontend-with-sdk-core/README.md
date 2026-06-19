@@ -41,7 +41,7 @@ Set these in the app's **Configuration** panel at runtime (or change the
 | **Project name** | Your SurfLiquid project name. |
 | **App ID** | Your SurfLiquid app/project ID. |
 | **Environment** | `mainnet` or `testnet`. |
-| **Chain ID** | e.g. `8453` (Base) or `137` (Polygon). |
+| **Chain ID** | e.g. `1` (Ethereum), `8453` (Base), or `137` (Polygon). |
 | **Wallet** | `metamask`, `trust`, `coinbase`, `rabby`, `phantom`, `walletconnect`, or `injected`. |
 | **WalletConnect project ID** | Only required when the wallet is `walletconnect`. |
 | **Asset / Deposit / Withdraw amount** | Used by the deposit/withdraw flow actions. |
