@@ -92,6 +92,8 @@ export default function App() {
   // selected chain (determined from the API after authentication).
   const [vaultDeployed, setVaultDeployed] = useState<boolean | null>(null);
   const [vaultAddress, setVaultAddress] = useState<string | null>(null);
+  // The SDK's active chain — mutable via switchChain after creation.
+  const [activeChainId, setActiveChainId] = useState<number | null>(null);
   const clientRef = useRef<SurfClientType | null>(null);
   const logIdRef = useRef(0);
 
@@ -208,6 +210,11 @@ export default function App() {
         // selected chain. Override via `rpcUrl` with a dedicated endpoint in production.
       });
 
+      // appId is required — validate it against the backend (GET /api/sdk/public/overview
+      // with the x-app-id header). Throws SurfError(INVALID_APP_ID) if it's rejected.
+      await client.verifyApp();
+      pushLog("success", "App ID verified.");
+
       // Set up WalletConnect adapter if a project ID is provided
       if (wcProjectId.trim()) {
         try {
@@ -235,6 +242,7 @@ export default function App() {
       attachClientEvents(client);
       // Reset flow state for the freshly created client.
       setClientReady(true);
+      setActiveChainId(client.getConfig().chainId);
       setWalletAddress(client.getWalletState()?.address ?? null);
       setAuthenticated(client.getAuthState().authenticated);
       setVaultDeployed(null);
@@ -428,8 +436,152 @@ export default function App() {
     });
   }
 
-  // The flows require an authenticated session AND a vault on the selected chain.
-  const flowsReady = authenticated && vaultDeployed === true;
+  async function readTokenBalance() {
+    await runAction("Get token balance", async () => {
+      const bal = await ensureClient().getTokenBalance(asset as `0x${string}`);
+      pushLog("info", `Token balance (raw) of ${asset}: ${bal.toString()}`);
+    });
+  }
+
+  async function readAssetProfit() {
+    await runAction("Get asset profit", async () => {
+      const client = ensureClient();
+      const profit = await client.getAssetProfit(asset as `0x${string}`);
+      const pct = await client.getAssetProfitPercentage(asset as `0x${string}`);
+      pushLog("info", `Profit for ${asset}: ${profit.toString()} (raw) · ${pct.toString()} (pct, raw)`);
+    });
+  }
+
+  async function readAllowedAssets() {
+    await runAction("Get allowed assets", async () => {
+      const assets = await ensureClient().getAllowedAssets();
+      pushLog("info", `Allowed assets (${assets.length}): ${assets.join(", ") || "none"}`);
+    });
+  }
+
+  async function readFeeInfo() {
+    await runAction("Get fee info", async () => {
+      const f = await ensureClient().getFeeInfo();
+      pushLog(
+        "info",
+        `Fees — revenue: ${f.revenueAddress} · fee: ${f.feePercentage.toString()} · rebalance: ${f.rebalanceFeePercentage.toString()} · merkl claim: ${f.merklClaimFeePercentage.toString()}`,
+      );
+    });
+  }
+
+  async function readBestVault() {
+    await runAction("Get best vault", async () => {
+      const client = ensureClient();
+      const symbol =
+        client.getSupportedTokens().find((t) => t.address.toLowerCase() === asset.toLowerCase())?.symbol ?? "USDC";
+      const options = await client.getBestVault(symbol);
+      pushLog(
+        "info",
+        `Best vault for ${symbol} (${options.length}): ${options.map((o) => `chain ${o.chainId} → ${o.vaultAddress}`).join(" | ") || "none"}`,
+      );
+    });
+  }
+
+  async function readOwnerVaults() {
+    await runAction("Get owner vaults", async () => {
+      const client = ensureClient();
+      const count = await client.getOwnerVaultCount();
+      const vaults = await client.getOwnerVaults();
+      pushLog("info", `Owner vaults (count ${count}): ${vaults.join(", ") || "none"}`);
+    });
+  }
+
+  async function checkVaultFromFactory() {
+    await runAction("Is vault from factory", async () => {
+      if (!vaultAddress) {
+        throw new Error("No vault address known — run Get vault first.");
+      }
+      const ok = await ensureClient().isVaultFromFactory(vaultAddress);
+      pushLog("info", `isVaultFromFactory(${vaultAddress}): ${ok}`);
+    });
+  }
+
+  async function checkHasInitialDeposit() {
+    await runAction("Has initial deposit", async () => {
+      const ok = await ensureClient().hasInitialDeposit(asset as `0x${string}`);
+      pushLog("info", `hasInitialDeposit(${asset}): ${ok}`);
+    });
+  }
+
+  async function doSwitchChain() {
+    await runAction("Switch chain", async () => {
+      const client = ensureClient();
+      await client.switchChain(Number(chainId));
+      const active = client.getConfig().chainId;
+      setActiveChainId(active);
+      // Point the Asset field at a token on the new chain so token reads don't
+      // query a wrong-chain address.
+      const tokens = client.getSupportedTokens();
+      if (tokens[0]) {
+        setAsset(tokens[0].address);
+      }
+      pushLog("success", `Active chain switched to ${active}`);
+      // Re-check vault deployment for the new chain (needs an authenticated wallet).
+      if (authenticated) {
+        await refreshVaultStatus(client);
+      }
+    });
+  }
+
+  async function doDisconnect() {
+    await runAction("Disconnect wallet", async () => {
+      await ensureClient().disconnectWallet();
+      setWalletAddress(null);
+      setAuthenticated(false);
+      setVaultDeployed(null);
+    });
+  }
+
+  async function doLogout() {
+    await runAction("Logout", async () => {
+      await ensureClient().logout();
+      setAuthenticated(false);
+      pushLog("info", "Logged out — local auth state cleared (cookie persists until it expires server-side).");
+    });
+  }
+
+  async function doVerifyApp() {
+    await runAction("Verify app", async () => {
+      await ensureClient().verifyApp();
+      pushLog("success", "App ID is valid.");
+    });
+  }
+
+  function showSupportedTokens() {
+    try {
+      const tokens = ensureClient().getSupportedTokens();
+      pushLog(
+        "success",
+        `Supported tokens (${tokens.length}): ${tokens.map((t) => `${t.symbol}@${t.address}`).join(", ") || "none"}`,
+      );
+    } catch (error) {
+      pushLog("error", `Get supported tokens failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  function showConfigState() {
+    try {
+      const client = ensureClient();
+      const cfg = client.getConfig();
+      pushLog(
+        "info",
+        `Config — env: ${cfg.environment} · chain: ${cfg.chainId} · rpc: ${cfg.rpcUrl} · api: ${cfg.apiBaseUrl} · factory: ${cfg.factoryAddress} · autoApprove: ${cfg.autoApprove}`,
+      );
+      const auth = client.getAuthState();
+      const wallet = client.getWalletState();
+      pushLog(
+        "info",
+        `State — wallet: ${wallet?.address ?? "none"} (chain ${wallet?.chainId ?? "n/a"}) · authenticated: ${auth.authenticated}`,
+      );
+    } catch (error) {
+      pushLog("error", `Get config/state failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   const nextStepHint = !clientReady
     ? "Step 1 — create the client to begin."
@@ -438,10 +590,10 @@ export default function App() {
       : !authenticated
         ? "Step 3 — authenticate (signs a message; the backend sets a session cookie)."
         : vaultDeployed === null
-          ? "Determining vault status for the selected chain…"
+          ? "Determining vault status for the active chain…"
           : vaultDeployed === false
-            ? "No vault on this chain yet — deploy one to unlock the flows."
-            : "Vault ready — use the flows below.";
+            ? "No vault on the active chain — Deploy vault (or switch chains). Flow actions error until a vault exists here."
+            : "Vault ready on the active chain — use the flows below.";
 
   return (
     <div className="shell">
@@ -457,6 +609,10 @@ export default function App() {
           <div>
             <span>Wallet</span>
             <strong>{walletAddress ?? "Not connected"}</strong>
+          </div>
+          <div>
+            <span>Active chain</span>
+            <strong>{activeChainId ?? chainId}</strong>
           </div>
           <div>
             <span>Auth</span>
@@ -594,7 +750,7 @@ export default function App() {
                 Deploy vault
               </button>
             )}
-            {flowsReady && (
+            {authenticated && (
               <button className="action" onClick={resolveVault} disabled={Boolean(busyAction)}>
                 Get vault
               </button>
@@ -608,7 +764,7 @@ export default function App() {
           <p className="hint">{nextStepHint}</p>
         </section>
 
-        {flowsReady && (
+        {authenticated && (
           <section className="panel">
             <div className="section-head">
               <h2>Flows</h2>
@@ -633,6 +789,67 @@ export default function App() {
                 Get agent messages
               </button>
             </div>
+          </section>
+        )}
+
+        {clientReady && (
+          <section className="panel">
+            <div className="section-head">
+              <h2>All SDK methods</h2>
+            </div>
+            <div className="button-row">
+              <button className="action" onClick={showConfigState} disabled={Boolean(busyAction)}>
+                Config &amp; state
+              </button>
+              <button className="action" onClick={showSupportedTokens} disabled={Boolean(busyAction)}>
+                Supported tokens
+              </button>
+              <button className="action" onClick={doVerifyApp} disabled={Boolean(busyAction)}>
+                Verify app
+              </button>
+              <button className="action" onClick={readTokenBalance} disabled={Boolean(busyAction)}>
+                Token balance
+              </button>
+              <button className="action" onClick={readBestVault} disabled={Boolean(busyAction)}>
+                Best vault
+              </button>
+              <button className="action" onClick={readOwnerVaults} disabled={Boolean(busyAction)}>
+                Owner vaults
+              </button>
+            </div>
+            <div className="button-row">
+              <button className="action" onClick={readFeeInfo} disabled={Boolean(busyAction)}>
+                Fee info
+              </button>
+              <button className="action" onClick={readAllowedAssets} disabled={Boolean(busyAction)}>
+                Allowed assets
+              </button>
+              <button className="action" onClick={checkHasInitialDeposit} disabled={Boolean(busyAction)}>
+                Has initial deposit
+              </button>
+              <button className="action" onClick={readAssetProfit} disabled={Boolean(busyAction)}>
+                Asset profit
+              </button>
+              <button className="action" onClick={checkVaultFromFactory} disabled={Boolean(busyAction)}>
+                Is vault from factory
+              </button>
+            </div>
+            <div className="button-row">
+              <button className="action" onClick={doSwitchChain} disabled={Boolean(busyAction)}>
+                Switch chain
+              </button>
+              <button className="action" onClick={doDisconnect} disabled={Boolean(busyAction)}>
+                Disconnect wallet
+              </button>
+              <button className="action" onClick={doLogout} disabled={Boolean(busyAction)}>
+                Logout
+              </button>
+            </div>
+            <p className="hint">
+              These exercise every public SDK method. Vault reads (fee info, allowed assets, profit,
+              has-initial-deposit) need a deployed vault; token balance / owner vaults need a connected
+              wallet — otherwise they log a clear SDK error.
+            </p>
           </section>
         )}
 

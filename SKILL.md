@@ -31,6 +31,8 @@ npm install @surf_liquid/core-sdk ethers
 - [When to use this skill](#when-to-use-this-skill)
 - [Two surfaces you must distinguish](#two-surfaces-you-must-distinguish)
 - [Supported chains](#supported-chains)
+- [Gas on Ethereum mainnet (low-fee defaults)](#gas-on-ethereum-mainnet-low-fee-defaults)
+- [Robust write-gas handling (Ethereum mainnet)](#robust-write-gas-handling-ethereum-mainnet)
 - [Installation](#installation)
 - [Initialization](#initialization)
 - [Integration flow (do this in order)](#integration-flow-do-this-in-order)
@@ -92,6 +94,36 @@ Notes:
 - Polygon's config field is named `wethAddress` but holds Polygon's WETH (`0x7ceB23fD…f619`), not WMATIC/WPOL — the field name is generic across chains.
 - The default RPCs are public and rate-limited; production consumers should override via `setRpcUrl(...)` or the `rpcUrl` config field.
 - **Base Sepolia (testnet) is a non-functional stub** out of the box: empty `rpcUrl`, zero factory/WETH addresses, and no tokens. To use it you must supply your own `rpcUrl` and register the chain's real contracts/tokens via `registerChain` / `registerToken` (or `setFactoryAddress`).
+
+## Gas on Ethereum mainnet (low-fee defaults)
+
+On **Ethereum mainnet (`chainId: 1`) only**, the SDK attaches explicit EIP-1559 fee overrides to every transaction it sends (vault deploy, deposit, withdraw, and the ERC-20 approval / WETH-wrap steps) so transactions cost as little as possible. On every other chain (Base, Polygon, Base Sepolia, and any custom chain) the SDK supplies **no** fee overrides and lets the wallet/provider pick fees as usual — this behavior is Ethereum-specific and there is **no integration change required** on any chain.
+
+What the SDK sets on Ethereum:
+
+- `type: 2` (EIP-1559) is set **explicitly**. This is deliberate: without an explicit `type: 2`, wallets such as MetaMask ignore a dapp's supplied 1559 fees and substitute their own "market" estimate, which is higher.
+- `maxPriorityFeePerGas` (the tip) is derived from `eth_feeHistory` over the last ~20 blocks: the SDK takes the per-block 10th-percentile priority fees, uses their median, and floors the result at **0.1 gwei** (`100_000_000` wei) so the tx stays includable.
+- `maxFeePerGas` is `baseFee * 1.25 + tip` — i.e. only **1.25x** base-fee headroom, **not** the 2x "survive 6 blocks" headroom that ethers/EIP-1559 defaults to.
+- If `eth_feeHistory` is unavailable, it falls back to the latest block's `baseFeePerGas` plus the 0.1 gwei floor tip.
+
+**"Site suggested" vs the wallet's own "Low" preset.** These values are tuned to line up with a wallet's **"Low"** fee tier. The reason the 2x headroom was dropped to 1.25x is that MetaMask was surfacing the 2x figure as a scarily high **"max"** on site-suggested (dapp-supplied) transactions, even though the effective cost is only ~`baseFee + tip`. With the 1.25x cap, the SDK's **"Site suggested"** fee no longer reads higher than the wallet's own lowest (Low) option. The trade-off is the same one the wallet's Low tier makes: a sharp base-fee spike between submission and inclusion can delay mining. Users who want faster inclusion can still override the fee in their wallet at confirmation time.
+
+Effective cost is still approximately `baseFee + tip`; the headroom only caps the worst-case ceiling — you are not charged the max.
+
+## Robust write-gas handling (Ethereum mainnet)
+
+To make first deposits and back-to-back deposit/withdraw flows reliable, the SDK **pre-estimates the gas limit for write transactions itself** (via the read RPC) and passes it to the wallet as an explicit `gasLimit`, instead of letting the wallet re-estimate. This is scoped to **Ethereum mainnet (`chainId: 1`)** — the chain where the failures below were observed and where the explicit low-fee overrides already apply — and covers `deployVault`, `deposit` (both the `initialDeposit` and `userDeposit` paths), and `withdraw`. A small **20% buffer** is added to the estimate so a slight state shift between estimate and mining can't cause out-of-gas (you still only pay for gas actually used).
+
+The estimate is done against the SDK's own read provider with the connected wallet as `from`. If that estimate hits a **genuine contract revert**, the error is re-thrown immediately (retrying wouldn't help); if it fails for a **transient/non-revert reason**, the SDK returns no gas limit and falls back to letting the wallet estimate — so robustness never makes a call strictly worse.
+
+**Deposit allowance-settle wait.** When `autoApprove` sends an approval before a deposit, the SDK then **polls the allowance** (up to 8 times, ~1s apart) via the read provider until the new allowance is visible before submitting the deposit. If the budget elapses it proceeds anyway (a genuinely-insufficient allowance surfaces on the deposit itself).
+
+Which `estimateGas` failures this fixes:
+
+- **Post-approval first-deposit revert.** The deposit's gas estimation can race the approval: if the estimating node hasn't yet observed the freshly-set allowance, the deposit's `transferFrom` reverts during `estimateGas` with `require(false)` / no revert data. The allowance-settle wait plus SDK-side pre-estimation removes this race.
+- **Stale-state re-estimation on deposit/withdraw.** Submitting a withdraw (or a second deposit) right after a deposit could make the wallet re-estimate against stale state and fail with `missing revert data` / `could not decode result data`. Pre-estimating against the read provider and passing an explicit `gasLimit` avoids the wallet's faulty re-estimate.
+
+All of this is internal — **no integration change is required**; deposits/withdrawals/deploys are simply more reliable on Ethereum.
 
 ## Installation
 
@@ -291,7 +323,7 @@ const wallet = await client.connectWallet("metamask"); // WalletState { address,
 
 After this, **Wallet**-level calls become available. `getWalletState()` returns the current `WalletState | null` synchronously.
 
-> `switchChain(chainId)` changes only the wallet's chain; it does **not** change `config.chainId`. Token resolution, factory address, and `getChainConfig()` keep using the chain you passed to `create(...)`. Keep the wallet on the same chain you configured.
+> `switchChain(chainId)` re-points the **whole SDK** at `chainId` — it updates `config.chainId`, `rpcUrl`, `factoryAddress`, the read provider, and token resolution from the chain registry, and switches the connected wallet too (works read-only without one). It throws `UNSUPPORTED_CHAIN` for a chain not registered for the environment, and your auth (the cookie session) is preserved — it's per-wallet, not per-chain.
 
 ### Step 4 — Authenticate (sets the httpOnly cookie)
 
@@ -521,6 +553,18 @@ Two cross-cutting rules to internalize:
 
 ---
 
+### Setup
+
+#### `verifyApp(): Promise<unknown>`
+
+| | |
+|---|---|
+| **Params** | none (reads `config.appId`). |
+| **Returns** | `Promise<unknown>` — resolves with the backend overview payload when the app ID is valid. |
+| **Requires** | none (no wallet, no auth). |
+
+Validates your `appId` against the backend (`GET /api/sdk/public/overview` with the `x-app-id` header). Call it right after creating the client to fail fast on a bad app ID. Throws `SurfError(MISSING_PROJECT_ID)` if no `appId` / `projectId` was provided, or `SurfError(INVALID_APP_ID)` if the backend rejects it.
+
 ### Wallet
 
 #### `connectWallet(walletName: WalletName | string): Promise<WalletState>`
@@ -559,11 +603,11 @@ Calls `activeWalletAdapter?.disconnect()`, clears the active adapter and wallet 
 |---|---|
 | **Params** | `chainId` — target chain id. |
 | **Returns** | `Promise<void>` |
-| **Requires** | wallet |
+| **Requires** | none (also switches the connected wallet if one is present) |
 
-Calls `activeWalletAdapter.switchChain(chainId)` and updates `walletState.chainId`.
+Re-points the **whole SDK** at `chainId`: validates it against the chain registry for the active environment (else `UNSUPPORTED_CHAIN`), updates `config.chainId`, `config.rpcUrl`, `config.factoryAddress` and the read provider, and — if a wallet is connected — calls `activeWalletAdapter.switchChain(chainId)` and updates `walletState.chainId`. Emits `wallet:chainChanged`.
 
-> Important: this updates **only the wallet state**, not `config.chainId`. `getChainConfig()`, `factoryAddress`, `wethAddress`, and token resolution all continue using the originally-configured chain. To target a different chain for SDK operations, construct a new client with that `chainId`.
+> This **is** the way to change the SDK's active chain at runtime — `getChainConfig()`, `factoryAddress`, `wethAddress`, token resolution and all reads follow to the new chain. Auth (the cookie session) is preserved (it's per-wallet, not per-chain). Any custom `rpcUrl` / `factoryAddress` you set at creation are replaced by the target chain's registry values, so re-apply them after switching if you need them.
 
 #### `registerWalletAdapter(name: string, adapter: IWalletAdapter): void`
 
@@ -952,7 +996,8 @@ Each enum member's string value is identical to its key (e.g. `SurfErrorCode.AUT
 | Code | Typical cause |
 |---|---|
 | `INVALID_CONFIG` | Supplied `SurfConfig` failed validation. |
-| `MISSING_PROJECT_ID` | Required project identifier was not provided/resolved. |
+| `MISSING_PROJECT_ID` | Required project identifier was not provided/resolved (also thrown by `verifyApp()` when `appId` is absent). |
+| `INVALID_APP_ID` | `appId` was rejected by the backend during `verifyApp()`. |
 | `INVALID_ENVIRONMENT` | `environment` is not `"mainnet"` or `"testnet"`. |
 | `UNSUPPORTED_CHAIN` | The requested `chainId` is not in the chain registry for the environment. |
 | `ENVIRONMENT_CHAIN_MISMATCH` | The chain does not belong to the configured environment (e.g. testnet chain on mainnet). |
@@ -1719,7 +1764,7 @@ console.log("Tokens:", surf.getSupportedTokens().map((t) => t.symbol)); // ["USD
 - **Best-vault resolution order:** `params.bestVault` (if provided) → REST `getBestVault(token.symbol)` filtered to `config.chainId` → on-chain `getAssetAvailableVaults(vault, asset)` taking index `[0]` → otherwise throws `SurfError(NO_BEST_VAULT, ...)`. This only matters for the **initial** deposit of an asset (subsequent deposits route through `userDeposit` and need no best vault).
 - **`rpcUrl` override applies to ALL chains.** The single `rpcUrl` config builds one `JsonRpcProvider` used for every read. It is not keyed per chain. Do **not** hardcode one chain's RPC if you may operate on another — every read method goes through that one provider. If omitted, the SDK falls back to the configured chain's default RPC (Base `https://mainnet.base.org`, Polygon `https://polygon-bor-rpc.publicnode.com`; Base Sepolia has `""` and **must** be supplied).
 - **A vault can have a different address per chain.** `VaultInfo.chainAddresses` lists per-chain vault addresses; on chains like Ethereum the vault address differs from the top-level `userVaultAddress` (the home-chain address). The SDK resolves the correct per-chain address automatically **only when you pass no `vaultAddress`** to `deposit`/`withdraw`/`getPortfolioSummary`/`getWithdrawableAmount`/`getAssetProfit`/etc. **Passing an explicit `userVaultAddress` on a non-home chain bypasses that resolution** and targets an address with no vault contract there, so the call fails with ethers `BAD_DATA` (`could not decode result data`, `value="0x"`). If you must pass one, use `chainAddresses.find(c => c.chainId === activeChainId)?.vaultAddress`.
-- **`switchChain()` does not update `config.chainId`.** It changes only the wallet's chain (`walletState.chainId`). `getChainConfig()`, `factoryAddress`, `wethAddress`, token resolution, and the read provider all keep using the originally configured chain. To truly operate on another chain, build a new client (or `setChain` before build), don't rely on `switchChain`.
+- **`switchChain()` re-points the whole SDK.** It updates `config.chainId`, `rpcUrl`, `factoryAddress`, the read provider, and token resolution from the chain registry (and switches the connected wallet, if any); it throws `UNSUPPORTED_CHAIN` for a chain not registered for the environment. It **is** the correct way to change the active chain at runtime, and auth (the cookie session) survives the switch. Caveat: a custom `rpcUrl` / `factoryAddress` passed to `create(...)` is replaced by the target chain's registry values, so re-apply those after switching if you depend on them.
 - **`getVault`, `getSupportedAssets`, `getAgentMessages`, `getBestVault` are public** (no wallet/auth required) — but `getVault` and `getAgentMessages` need an address. If you omit `walletAddress`, they fall back to `requireWallet().address` and will throw `WALLET_NOT_CONNECTED` when no wallet is connected. Pass an explicit address to call them without a connected wallet. (`getSupportedAssets` and `getBestVault` need neither wallet nor an address.)
 - **Register custom chains/tokens BEFORE `setChain`/`build`.** Use the builder: `registerChain(env, chainConfig)` then `registerToken(...)`, and only then `setChain(chainId)` / `build()`. Registering after build has no effect on an already-constructed client. Note also that the standalone helpers `getFactoryAddress`/`getWethAddress` read the module-level `CHAIN_REGISTRIES`, so they won't see chains you registered on the builder.
 - **`deployVault()` throws `VAULT_ALREADY_EXISTS` if a vault already exists on the current chain.** The guard checks `existing.exists && existing.assets.some(a => a.chainId === config.chainId && a.vaultAddress)`. A vault that exists only on a *different* chain is fine (it reuses the stored `deploymentSalt` and re-deploys on the current chain). Check `getVault()` / catch this error before calling `deployVault()`.

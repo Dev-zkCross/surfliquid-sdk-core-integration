@@ -151,6 +151,19 @@ never on a token** — there isn't one to read.
 
 ---
 
+## Gas on Ethereum mainnet
+
+When the configured **Chain ID is `1` (Ethereum)**, the SDK automatically asks your wallet
+to use **low ("Low"-tier) gas fees**, so MetaMask's confirmation screen shows a low
+**"Site suggested"** max fee — that's expected, not a bug. On Base and Polygon the wallet
+picks fees as usual.
+
+The SDK also manages ERC-20 approval and gas-estimation timing for you, so first deposits
+and back-to-back deposit → withdraw flows confirm cleanly without manual retries. None of
+this needs any configuration on your side.
+
+---
+
 ## Troubleshooting
 
 - **"No supported assets found" / empty reads** — make sure the installed SDK is
@@ -163,6 +176,9 @@ never on a token** — there isn't one to read.
   allowlisted origin (e.g. `http://localhost:3000`).
 - **Wallet buttons do nothing** — a browser wallet extension must be installed; for
   WalletConnect, set a WalletConnect project ID.
+- **An Ethereum deposit/withdraw is slow to mine** — during a base-fee spike the low
+  ("Low"-tier) gas fee can take longer to include; bump the fee in your wallet at
+  confirmation time if you need it faster.
 
 ## Notes
 
